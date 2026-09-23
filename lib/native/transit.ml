@@ -205,27 +205,32 @@ module Json = struct
         else acc @ [ (key, value) ])
       [] entries
 
-  let key_string context = function
-    | Null -> Some "~_"
-    | Bool true -> Some "~?t"
-    | Bool false -> Some "~?f"
-    | String text -> Some (write_cache_any context (escaped_string text))
-    | Int value -> Some ("~i" ^ string_of_int value)
-    | Int64 value -> Some ("~i" ^ Int64.to_string value)
-    | Float value -> Some ("~i" ^ Yojson.Safe.to_string (`Float value))
-    | Binary text -> Some ("~b" ^ base64_encode text)
-    | Keyword text -> Some (write_cache_token context ("~:" ^ text))
-    | Symbol text -> Some (write_cache_token context ("~$" ^ text))
-    | Big_decimal text -> Some ("~f" ^ text)
-    | Big_int text -> Some ("~n" ^ text)
-    | Date milliseconds ->
-        Some
+  let key_string context value =
+    let raw =
+      match value with
+      | Null -> "~_"
+      | Bool true -> "~?t"
+      | Bool false -> "~?f"
+      | String text -> escaped_string text
+      | Int value -> "~i" ^ string_of_int value
+      | Int64 value -> "~i" ^ Int64.to_string value
+      | Float value -> "~d" ^ Yojson.Safe.to_string (`Float value)
+      | Binary text -> "~b" ^ base64_encode text
+      | Keyword text -> "~:" ^ text
+      | Symbol text -> "~$" ^ text
+      | Big_decimal text -> "~f" ^ text
+      | Big_int text -> "~n" ^ text
+      | Date milliseconds ->
           (match context.mode with
           | Normal -> "~m" ^ Int64.to_string milliseconds
           | Verbose -> "~t" ^ iso_of_milliseconds milliseconds)
-    | Uuid text -> Some ("~u" ^ text)
-    | Uri text -> Some ("~r" ^ text)
+      | Uuid text -> "~u" ^ text
+      | Uri text -> "~r" ^ text
+      | Array _ | Map _ | Set _ | List _ | Tagged _ -> ""
+    in
+    match value with
     | Array _ | Map _ | Set _ | List _ | Tagged _ -> None
+    | _ -> Some (write_cache_any context raw)
 
   let stringable_key = function
     | Array _ | Map _ | Set _ | List _ | Tagged _ -> false
@@ -344,7 +349,11 @@ module Json = struct
   let decode_tagged_string ?(cache_token = true) context text =
     let len = String.length text in
     if len = 0 then String text
-    else if Char.equal text.[0] '^' && len > 1 then decode_cache_ref context text
+    else if
+      Char.equal text.[0] '^'
+      && len > 1
+      && not (Char.equal text.[1] ' ')
+    then decode_cache_ref context text
     else if not (Char.equal text.[0] '~') then String text
     else if len = 1 then decode_error "invalid Transit escape"
     else
@@ -366,6 +375,10 @@ module Json = struct
       | 'i' -> transit_int rep
       | 'n' -> Big_int rep
       | 'f' -> Big_decimal rep
+      | 'd' -> (
+          match float_of_string_opt rep with
+          | Some value -> Float value
+          | None -> decode_error ("invalid Transit double: " ^ text))
       | 'b' -> Binary (base64_decode rep)
       | 'm' -> (
           match Int64.of_string_opt rep with
@@ -458,7 +471,18 @@ module Json = struct
     else None
 
   and decode_map_key context key =
-    if String.length key > 1 && Char.equal key.[0] '^' then decode_cache_ref context key
+    let len = String.length key in
+    if
+      len > 1
+      && len <= 3
+      && Char.equal key.[0] '^'
+      && not (Char.equal key.[1] ' ')
+    then decode_cache_ref context key
+    else if Char.equal key.[0] '^' then
+      (* a >3-char key starting with '^' is a literal string key, not a
+         cache reference (transit-js: isCacheable wins over isCacheCode
+         for map keys) *)
+      read_cache_value context key (String key)
     else
       let value = decode_tagged_string ~cache_token:false context key in
       read_cache_value context key value
